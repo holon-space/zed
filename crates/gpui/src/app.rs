@@ -183,6 +183,16 @@ impl Application {
         F: 'static + FnOnce(&mut App),
     {
         let this = self.0.clone();
+        // On iOS, UIApplicationMain owns the run loop: Application::run returns
+        // after storing `on_finish_launching` on the platform, and UIKit later
+        // drives frames, lifecycle callbacks, and async tasks. If the only
+        // strong Rc<AppCell> refs are this temporary Application and the
+        // to-be-taken finish-launching closure, AppCell drops as soon as that
+        // closure runs — leaving every Weak<AppCell> held by AsyncApp / windows
+        // / lifecycle callbacks dangling. Leak an extra strong clone so the
+        // context outlives the first pass through the run loop.
+        #[cfg(target_os = "ios")]
+        std::mem::forget(self.0.clone());
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
