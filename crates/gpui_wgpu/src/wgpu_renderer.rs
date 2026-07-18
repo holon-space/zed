@@ -1338,12 +1338,25 @@ impl WgpuRenderer {
             }
         };
 
-        // Now that we know the surface is healthy, ensure intermediate textures exist
-        self.ensure_intermediate_textures();
-
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        if let Err(error) = self.encode_scene_to_view(scene, &frame_view) {
+            log::error!("{error:#}");
+            self.resources().queue.submit(std::iter::empty());
+            return false;
+        }
+
+        frame.present();
+        true
+    }
+
+    /// Encodes and submits `scene` into `view` without presenting. Shared by
+    /// [`Self::draw`] (swapchain view) and [`Self::render_scene_to_image`]
+    /// (offscreen view), so a capture never touches the swapchain.
+    fn encode_scene_to_view(&mut self, scene: &Scene, view: &wgpu::TextureView) -> Result<()> {
+        self.ensure_intermediate_textures();
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1392,14 +1405,132 @@ impl WgpuRenderer {
             );
         }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
-            log::error!("{error:#}");
-            self.resources().queue.submit(std::iter::empty());
-            return false;
+        self.record_frame(scene, view)
+    }
+
+    /// Renders `scene` into an offscreen `RENDER_ATTACHMENT | COPY_SRC` texture
+    /// and reads it back as RGBA8. The capture cost is paid only when called;
+    /// steady-state presentation is unaffected.
+    pub fn render_scene_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        if !self.surface_configured {
+            anyhow::bail!(
+                "cannot capture screenshot: wgpu surface is unconfigured \
+                 (window backgrounded or surface lost)"
+            );
         }
 
-        frame.present();
-        true
+        self.atlas.before_frame();
+
+        let width = self.surface_config.width.max(1);
+        let height = self.surface_config.height.max(1);
+        let format = self.surface_config.format;
+        let device = self.resources().device.clone();
+        let queue = self.resources().queue.clone();
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screenshot_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.encode_scene_to_view(scene, &target_view)?;
+
+        let unpadded_bytes_per_row = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot_readback"),
+            size: (padded_bytes_per_row as u64) * (height as u64),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("screenshot_copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let map_result: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
+            Arc::new(Mutex::new(None));
+        let map_result_cb = map_result.clone();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            *map_result_cb.lock().unwrap() = Some(res);
+        });
+
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|e| anyhow::anyhow!("device poll failed during screenshot readback: {e:?}"))?;
+
+        let mapped = map_result
+            .lock()
+            .unwrap()
+            .take()
+            .context("map_async callback never fired after device poll")?;
+        if let Err(e) = mapped {
+            anyhow::bail!("failed to map screenshot readback buffer: {e:?}");
+        }
+
+        let swizzle_bgra = matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        {
+            let data = slice.get_mapped_range();
+            for row in 0..height {
+                let start = (row * padded_bytes_per_row) as usize;
+                let row_slice = &data[start..start + unpadded_bytes_per_row as usize];
+                if swizzle_bgra {
+                    for px in row_slice.chunks_exact(4) {
+                        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                    }
+                } else {
+                    rgba.extend_from_slice(row_slice);
+                }
+            }
+        }
+        readback.unmap();
+
+        image::RgbaImage::from_raw(width, height, rgba).with_context(|| {
+            format!("screenshot buffer did not match target dimensions {width}x{height}")
+        })
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
