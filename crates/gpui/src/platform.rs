@@ -699,7 +699,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// Available in prod builds (not just `test-support`) so the in-app MCP
+    /// screenshot tool can capture the live window on platforms like Android
+    /// that have no OS-level window-capture path. Platforms that do not
+    /// implement it keep the fail-loud default below.
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
