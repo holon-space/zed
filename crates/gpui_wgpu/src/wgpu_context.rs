@@ -162,13 +162,41 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        #[allow(unused_mut)]
+        let mut flags = wgpu::InstanceFlags::default();
+        // The Android emulator's guest Vulkan ICD (vulkan.ranchu, Mesa gfxstream)
+        // SIGSEGVs inside vk_common_SetDebugUtilsObjectNameEXT, which wgpu-hal calls
+        // for every Vulkan object when the DEBUG instance flag is set — i.e. in every
+        // debug_assertions build. Strip DEBUG there (disclosed below), so debug builds
+        // can run on the emulator at all; release builds and real devices are unaffected.
+        #[cfg(target_os = "android")]
+        if flags.contains(wgpu::InstanceFlags::DEBUG) && Self::is_android_emulator() {
+            log::warn!(
+                "Android emulator detected (ro.boot.qemu=1): dropping wgpu \
+                 InstanceFlags::DEBUG to avoid a SIGSEGV in the emulator's broken \
+                 VK_EXT_debug_utils (vulkan.ranchu vk_common_SetDebugUtilsObjectNameEXT); \
+                 Vulkan objects will be unlabeled in GPU captures"
+            );
+            flags.remove(wgpu::InstanceFlags::DEBUG);
+        }
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
+            flags,
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
             display: Some(display),
         })
+    }
+
+    // `getprop` is the only dependency-free way to read Android system properties;
+    // this runs once per instance creation. Failure to run it means "not an emulator".
+    #[cfg(target_os = "android")]
+    fn is_android_emulator() -> bool {
+        std::process::Command::new("getprop")
+            .arg("ro.boot.qemu")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+            .unwrap_or(false)
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
