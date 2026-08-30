@@ -73,7 +73,16 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScrollFraction>,
     follow_state: FollowState,
+    /// Height given to items that have never been measured, averaged over the
+    /// measured ones.
+    size_hint: Option<Pixels>,
 }
+
+/// How far the measured average may drift from the standing estimate before every
+/// hint is rewritten. Crossing it walks the whole tree, and while the measured
+/// sample is still small a stream of remeasurements can cross it every few frames,
+/// until a wider sample steadies the average.
+const ESTIMATE_TOLERANCE: f32 = 0.125;
 
 /// Keeps track of a fractional scroll position within an item for restoration
 /// after remeasurement.
@@ -262,6 +271,8 @@ struct ListItemSummary {
     rendered_count: usize,
     unrendered_count: usize,
     height: Pixels,
+    /// Height contributed by measured items alone, excluding every size hint.
+    measured_height: Pixels,
     has_focus_handles: bool,
 }
 
@@ -292,6 +303,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            size_hint: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -413,11 +425,12 @@ impl ListState {
         old_items.seek_forward(&Count(old_range.end), Bias::Right);
 
         let mut spliced_count = 0;
+        let size_hint = state.size_hint.map(|height| size(px(0.), height));
         new_items.extend(
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
                 ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint,
                     focus_handle,
                 }
             }),
@@ -671,6 +684,59 @@ impl ListState {
 }
 
 impl StateInner {
+    /// Give never-measured items an estimated height from their measured siblings.
+    ///
+    /// An `Unmeasured` item with no hint contributes zero height to the summary, and
+    /// scroll bounds come from that summary. Absent an estimate the tail of a list
+    /// that has never been rendered stays out of reach, and so never gets measured.
+    ///
+    /// The estimate extrapolates from the items measured so far, so a sample that is
+    /// unrepresentative of the tail misjudges it until more of the tail is measured.
+    fn estimate_unmeasured_heights(&mut self) {
+        let summary = self.items.summary();
+        let unrendered_count = summary.unrendered_count;
+        if summary.rendered_count == 0 {
+            return;
+        }
+
+        // Only measured items feed the average: hints are extrapolated from it, and
+        // folding them back in compounds the estimate on itself.
+        let average = summary.measured_height / summary.rendered_count as f32;
+
+        // Rewriting the hints walks the whole tree, so hold the standing estimate
+        // while the average stays close enough to leave the geometry where it is.
+        // Comparing against live measurements keeps this honest across a `reset`,
+        // which swaps in content of an entirely different height.
+        if let Some(hint) = self.size_hint
+            && (average - hint).abs() <= hint * ESTIMATE_TOLERANCE
+        {
+            return;
+        }
+        let previous = self.size_hint.map(|height| size(px(0.), height));
+        self.size_hint = Some(average);
+
+        if unrendered_count == 0 {
+            return;
+        }
+        let estimate = size(px(0.), average);
+        self.items = SumTree::from_iter(
+            self.items.iter().map(|item| match item {
+                // Hints equal to the standing estimate came from here and are replaced.
+                // `remeasure_items` hints an item its own last measured height; it survives
+                // unless it coincides with the estimate, and is re-measured when rendered.
+                ListItem::Unmeasured {
+                    size_hint,
+                    focus_handle,
+                } if size_hint.is_none() || *size_hint == previous => ListItem::Unmeasured {
+                    size_hint: Some(estimate),
+                    focus_handle: focus_handle.clone(),
+                },
+                other => other.clone(),
+            }),
+            (),
+        );
+    }
+
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
         let height = self
@@ -986,6 +1052,7 @@ impl StateInner {
         cursor.seek(&Count(measured_range.end), Bias::Right);
         new_items.append(cursor.suffix(), ());
         self.items = new_items;
+        self.estimate_unmeasured_heights();
 
         // If follow_tail mode is on but the user scrolled away
         // (is_following is false), check whether the current scroll
@@ -1291,6 +1358,7 @@ impl Element for List {
 
             state.items = new_items;
             state.measuring_behavior.reset();
+            state.size_hint = None;
         }
 
         let padding = style
@@ -1382,6 +1450,7 @@ impl sum_tree::Item for ListItem {
                 } else {
                     px(0.)
                 },
+                measured_height: px(0.),
                 has_focus_handles: focus_handle.is_some(),
             },
             ListItem::Measured {
@@ -1391,6 +1460,7 @@ impl sum_tree::Item for ListItem {
                 rendered_count: 1,
                 unrendered_count: 0,
                 height: size.height,
+                measured_height: size.height,
                 has_focus_handles: focus_handle.is_some(),
             },
         }
@@ -1407,6 +1477,7 @@ impl sum_tree::ContextLessSummary for ListItemSummary {
         self.rendered_count += summary.rendered_count;
         self.unrendered_count += summary.unrendered_count;
         self.height += summary.height;
+        self.measured_height += summary.measured_height;
         self.has_focus_handles |= summary.has_focus_handles;
     }
 }
@@ -1496,6 +1567,292 @@ mod test {
         // Scroll position should stay at the top of the list
         assert_eq!(state.logical_scroll_top().item_ix, 0);
         assert_eq!(state.logical_scroll_top().offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_max_scroll_reveals_last_item(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // 10 items of 100px in a 100px viewport: exactly one item fits, and the
+        // content is 1000px tall, so the bottom of the list is 900px down.
+        // Zero overdraw keeps exactly one item measured per frame, so reaching
+        // the tail rests entirely on the estimated heights.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(100.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let draw = |cx: &mut gpui::VisualTestContext, state: &ListState| {
+            let state = state.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+                cx.new(|_| TestView(state)).into_any_element()
+            });
+        };
+
+        draw(cx, &state);
+
+        // Scroll to the bottom. Repeated so that any convergence the list needs
+        // has happened; the last item must end up fully visible, not clipped.
+        for _ in 0..5 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(1.), px(1.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+                ..Default::default()
+            });
+            draw(cx, &state);
+        }
+
+        // At the bottom the viewport shows the last item and nothing past it.
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            9,
+            "max scroll should reach the last item"
+        );
+        assert_eq!(
+            state.logical_scroll_top().offset_in_item,
+            px(0.),
+            "the last item should be fully visible, not clipped"
+        );
+    }
+
+    #[gpui::test]
+    fn test_estimates_stay_close_to_true_height_as_items_are_appended(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        // As above: one 100px item measured per frame, the rest estimated.
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(100.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let draw = |cx: &mut gpui::VisualTestContext, state: &ListState| {
+            let state = state.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+                cx.new(|_| TestView(state)).into_any_element()
+            });
+        };
+
+        draw(cx, &state);
+
+        for _ in 0..3 {
+            state.splice(state.item_count()..state.item_count(), 1);
+            draw(cx, &state);
+        }
+
+        // 13 items of 100px in a 100px viewport: 1200px of scrollable content.
+        let max_offset = state.max_offset_for_scrollbar().y;
+        assert!(
+            (px(1_150.)..=px(1_250.)).contains(&max_offset),
+            "estimated content height should track 13 items of 100px, got a max \
+             scroll offset of {max_offset:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_estimates_recover_after_reset_to_taller_content(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let item_height = Rc::new(Cell::new(20usize));
+        let state = ListState::new(200, crate::ListAlignment::Top, px(0.));
+
+        struct TestView {
+            state: ListState,
+            item_height: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.item_height.get();
+                list(self.state.clone(), move |_, _, _| {
+                    div().h(px(height as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state_clone = state.clone();
+        let item_height_clone = item_height.clone();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state_clone,
+                item_height: item_height_clone,
+            })
+        });
+        let mut draw = |cx: &mut gpui::VisualTestContext| {
+            let view = view.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                view.into_any_element()
+            });
+        };
+
+        // Walk the whole list so a wide sample of the 20px items is measured.
+        draw(cx);
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(1.), px(1.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                ..Default::default()
+            });
+            draw(cx);
+        }
+
+        // Swap in taller content, as a panel switching to a different list does.
+        item_height.set(500);
+        state.reset(60);
+        draw(cx);
+        draw(cx);
+
+        // 60 items of 500px in a 100px viewport: 29_900px of scrollable content.
+        let max_offset = state.max_offset_for_scrollbar().y;
+        assert!(
+            (px(29_000.)..=px(30_500.)).contains(&max_offset),
+            "estimates should follow the list down to its new content, got a max \
+             scroll offset of {max_offset:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_estimates_recover_after_reset_to_shorter_content(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let item_height = Rc::new(Cell::new(500usize));
+        let state = ListState::new(60, crate::ListAlignment::Top, px(0.));
+
+        struct TestView {
+            state: ListState,
+            item_height: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.item_height.get();
+                list(self.state.clone(), move |_, _, _| {
+                    div().h(px(height as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state_clone = state.clone();
+        let item_height_clone = item_height.clone();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state_clone,
+                item_height: item_height_clone,
+            })
+        });
+        let mut draw = |cx: &mut gpui::VisualTestContext| {
+            let view = view.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                view.into_any_element()
+            });
+        };
+
+        draw(cx);
+        for _ in 0..40 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(1.), px(1.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-1_000.))),
+                ..Default::default()
+            });
+            draw(cx);
+        }
+
+        item_height.set(20);
+        state.reset(10);
+        draw(cx);
+        draw(cx);
+
+        // 10 items of 20px in a 100px viewport: 200px of content, which fits, so
+        // there is nothing to scroll.
+        let max_offset = state.max_offset_for_scrollbar().y;
+        assert!(
+            (px(0.)..=px(250.)).contains(&max_offset),
+            "estimates should follow the list up to its new content, got a max \
+             scroll offset of {max_offset:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_estimates_recover_after_a_shrinking_splice(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let item_height = Rc::new(Cell::new(20usize));
+        let state = ListState::new(2_000, crate::ListAlignment::Top, px(0.));
+
+        struct TestView {
+            state: ListState,
+            item_height: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.item_height.get();
+                list(self.state.clone(), move |_, _, _| {
+                    div().h(px(height as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state_clone = state.clone();
+        let item_height_clone = item_height.clone();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state_clone,
+                item_height: item_height_clone,
+            })
+        });
+        let mut draw = |cx: &mut gpui::VisualTestContext| {
+            let view = view.clone();
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+                view.into_any_element()
+            });
+        };
+
+        // Measure roughly the first hundred items, leaving the rest untouched.
+        draw(cx);
+        for _ in 0..20 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(1.), px(1.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                ..Default::default()
+            });
+            draw(cx);
+        }
+
+        // Drop every measured item, so only never-measured ones survive the shrink.
+        item_height.set(500);
+        state.splice(0..1_900, 0);
+        draw(cx);
+        draw(cx);
+
+        // 100 items of 500px in a 100px viewport: 49_900px of scrollable content.
+        let max_offset = state.max_offset_for_scrollbar().y;
+        assert!(
+            (px(48_000.)..=px(51_000.)).contains(&max_offset),
+            "estimates should re-converge on the surviving items, got a max \
+             scroll offset of {max_offset:?}"
+        );
     }
 
     #[gpui::test]
