@@ -80,6 +80,20 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
+/// Returns the text system of [`current_platform`] without creating the
+/// platform, so it can be called off the main thread.
+pub fn current_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+    #[cfg(target_os = "macos")]
+    {
+        gpui_macos::current_text_system()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        current_platform(true).text_system()
+    }
+}
+
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
 #[cfg(any(feature = "bench-support", feature = "test-support"))]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {

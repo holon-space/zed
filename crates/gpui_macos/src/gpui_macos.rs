@@ -57,6 +57,21 @@ pub(crate) use text_system::*;
 
 pub use platform::MacPlatform;
 
+/// Returns the text system [`MacPlatform`] uses, without creating the platform.
+/// The platform must be created on the main thread; the text system need not,
+/// so callers off the main thread (headless tests) use this instead.
+pub fn current_text_system() -> std::sync::Arc<dyn gpui::PlatformTextSystem> {
+    #[cfg(feature = "font-kit")]
+    {
+        std::sync::Arc::new(MacTextSystem::new())
+    }
+
+    #[cfg(not(feature = "font-kit"))]
+    {
+        std::sync::Arc::new(gpui::NoopTextSystem::new())
+    }
+}
+
 trait BoolExt {
     fn to_objc(self) -> BOOL;
 }
