@@ -1153,6 +1153,21 @@ enum InputModality {
     Touch,
 }
 
+/// The depths of a window's per-frame element stacks at one point in a draw,
+/// as taken by [`Window::frame_stacks`] and restored by
+/// [`Window::restore_frame_stacks`].
+#[derive(Clone, Copy, Debug)]
+pub struct FrameStacks {
+    element_id: usize,
+    text_style: usize,
+    rendered_entity: usize,
+    element_offset: usize,
+    content_mask: usize,
+    image_cache: usize,
+    rem_size_override: usize,
+    element_opacity: f32,
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -2956,6 +2971,52 @@ impl Window {
     /// UI to scale, just like zooming a web page.
     pub fn set_rem_size(&mut self, rem_size: impl Into<Pixels>) {
         self.rem_size = rem_size.into();
+    }
+
+    /// How deep each of the window's per-frame element stacks is right now.
+    /// Take one before entering a panic boundary around a part of the element
+    /// tree and hand it back to [`Window::restore_frame_stacks`] once the
+    /// boundary has swallowed an unwind: every `with_*` helper pops in its own
+    /// frame, so an unwind past them leaves their pushes open and `draw`'s own
+    /// depth asserts then fire outside the boundary.
+    pub fn frame_stacks(&self) -> FrameStacks {
+        FrameStacks {
+            element_id: self.element_id_stack.len(),
+            text_style: self.text_style_stack.len(),
+            rendered_entity: self.rendered_entity_stack.len(),
+            element_offset: self.element_offset_stack.len(),
+            content_mask: self.content_mask_stack.len(),
+            image_cache: self.image_cache_stack.len(),
+            rem_size_override: self.rem_size_override_stack.len(),
+            element_opacity: self.element_opacity,
+        }
+    }
+
+    /// Drop everything the element tree pushed onto the per-frame stacks since
+    /// `stacks` was taken. See [`Window::frame_stacks`].
+    ///
+    /// Panics if a stack is shallower than it was: that means the caller is
+    /// restoring across a frame that already popped past its own pushes.
+    pub fn restore_frame_stacks(&mut self, stacks: FrameStacks) {
+        assert!(
+            self.element_id_stack.len() >= stacks.element_id
+                && self.text_style_stack.len() >= stacks.text_style
+                && self.rendered_entity_stack.len() >= stacks.rendered_entity
+                && self.element_offset_stack.len() >= stacks.element_offset
+                && self.content_mask_stack.len() >= stacks.content_mask
+                && self.image_cache_stack.len() >= stacks.image_cache
+                && self.rem_size_override_stack.len() >= stacks.rem_size_override,
+            "restore_frame_stacks: a per-frame stack is shallower than when the snapshot was taken"
+        );
+        self.element_id_stack.truncate(stacks.element_id);
+        self.text_style_stack.truncate(stacks.text_style);
+        self.rendered_entity_stack.truncate(stacks.rendered_entity);
+        self.element_offset_stack.truncate(stacks.element_offset);
+        self.content_mask_stack.truncate(stacks.content_mask);
+        self.image_cache_stack.truncate(stacks.image_cache);
+        self.rem_size_override_stack
+            .truncate(stacks.rem_size_override);
+        self.element_opacity = stacks.element_opacity;
     }
 
     /// Acquire a globally unique identifier for the given ElementId.
