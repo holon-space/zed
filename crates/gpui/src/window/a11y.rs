@@ -217,6 +217,13 @@ impl A11y {
         self.active_this_frame
     }
 
+    /// Raise the flag the platform adapter would raise when assistive
+    /// technology attaches. Takes effect from the next frame, like the real
+    /// callback does.
+    pub(crate) fn request_active(&self) {
+        self.active_flag.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn set_focusable(&mut self, node_id: NodeId, focus_id: FocusId) {
         self.focus_ids.insert(node_id, focus_id);
     }
@@ -463,6 +470,27 @@ impl A11yNodeBuilder {
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
             self.all_nodes.push((id, node));
+        }
+    }
+
+    /// How many nodes are open on the stack; the root counts as one while a
+    /// frame is being built, and the stack is empty outside a frame.
+    pub(crate) fn depth(&self) -> usize {
+        self.ids_stack.len()
+    }
+
+    /// Finalize every node opened since the stack was `depth` deep, in place of
+    /// the [`Self::pop`] calls an unwound element never reached. The nodes keep
+    /// the children they did get, so the tree stays a tree — the subtree is
+    /// partial because the element that owns it failed to draw.
+    pub(crate) fn truncate_to(&mut self, depth: usize) {
+        assert!(
+            depth <= self.ids_stack.len(),
+            "a11y truncate_to({depth}) past the current depth {}",
+            self.ids_stack.len()
+        );
+        while self.ids_stack.len() > depth {
+            self.pop();
         }
     }
 

@@ -1166,6 +1166,8 @@ pub struct FrameStacks {
     image_cache: usize,
     rem_size_override: usize,
     element_opacity: f32,
+    a11y_nodes: usize,
+    dispatch_nodes: usize,
 }
 
 /// Holds the state for a specific window.
@@ -2973,7 +2975,9 @@ impl Window {
         self.rem_size = rem_size.into();
     }
 
-    /// How deep each of the window's per-frame element stacks is right now.
+    /// How deep each of the window's frame-scoped stacks is right now — the
+    /// element stacks, the accessibility node stack and the dispatch tree's
+    /// nodes.
     /// Take one before entering a panic boundary around a part of the element
     /// tree and hand it back to [`Window::restore_frame_stacks`] once the
     /// boundary has swallowed an unwind: every `with_*` helper pops in its own
@@ -2989,7 +2993,16 @@ impl Window {
             image_cache: self.image_cache_stack.len(),
             rem_size_override: self.rem_size_override_stack.len(),
             element_opacity: self.element_opacity,
+            a11y_nodes: self.a11y.nodes.depth(),
+            dispatch_nodes: self.next_frame.dispatch_tree.node_depth(),
         }
+    }
+
+    /// Turn accessibility on for this window the way the platform adapter does
+    /// when assistive technology attaches, so a test can exercise the a11y
+    /// tree. Takes effect from the next frame.
+    pub fn request_a11y_active(&self) {
+        self.a11y.request_active();
     }
 
     /// Drop everything the element tree pushed onto the per-frame stacks since
@@ -3005,7 +3018,9 @@ impl Window {
                 && self.element_offset_stack.len() >= stacks.element_offset
                 && self.content_mask_stack.len() >= stacks.content_mask
                 && self.image_cache_stack.len() >= stacks.image_cache
-                && self.rem_size_override_stack.len() >= stacks.rem_size_override,
+                && self.rem_size_override_stack.len() >= stacks.rem_size_override
+                && self.a11y.nodes.depth() >= stacks.a11y_nodes
+                && self.next_frame.dispatch_tree.node_depth() >= stacks.dispatch_nodes,
             "restore_frame_stacks: a per-frame stack is shallower than when the snapshot was taken"
         );
         self.element_id_stack.truncate(stacks.element_id);
@@ -3017,6 +3032,10 @@ impl Window {
         self.rem_size_override_stack
             .truncate(stacks.rem_size_override);
         self.element_opacity = stacks.element_opacity;
+        self.a11y.nodes.truncate_to(stacks.a11y_nodes);
+        self.next_frame
+            .dispatch_tree
+            .truncate_nodes_to(stacks.dispatch_nodes);
     }
 
     /// Acquire a globally unique identifier for the given ElementId.

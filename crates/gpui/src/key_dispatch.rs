@@ -175,6 +175,24 @@ impl DispatchTree {
         node_id
     }
 
+    /// How many nodes are open on the stack.
+    pub fn node_depth(&self) -> usize {
+        self.node_stack.len()
+    }
+
+    /// Close every node opened since the stack was `depth` deep, in place of
+    /// the [`Self::pop_node`] calls an unwound element never reached.
+    pub fn truncate_nodes_to(&mut self, depth: usize) {
+        assert!(
+            depth <= self.node_stack.len(),
+            "truncate_nodes_to({depth}) past the current depth {}",
+            self.node_stack.len()
+        );
+        while self.node_stack.len() > depth {
+            self.pop_node();
+        }
+    }
+
     pub fn set_active_node(&mut self, node_id: DispatchNodeId) {
         let next_node_parent = self.nodes[node_id.0].parent;
         while self.node_stack.last().copied() != next_node_parent && !self.node_stack.is_empty() {
