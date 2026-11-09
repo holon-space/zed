@@ -2276,6 +2276,23 @@ impl Window {
         }
     }
 
+    /// The views that a notify marked dirty and that no draw has rendered since.
+    /// A notify during a draw leaves its view here without dirtying the window,
+    /// so the view keeps its old paint until something else dirties the window.
+    pub fn pending_dirty_views(&self) -> Vec<EntityId> {
+        assert!(
+            self.invalidator.not_drawing(),
+            "pending_dirty_views read during a draw"
+        );
+        self.invalidator
+            .inner
+            .borrow()
+            .dirty_views
+            .iter()
+            .copied()
+            .collect()
+    }
+
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
