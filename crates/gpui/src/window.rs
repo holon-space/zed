@@ -257,6 +257,10 @@ impl WindowInvalidator {
         mem::take(&mut self.inner.borrow_mut().frame_dirty)
     }
 
+    pub fn mark_pending(&self, entity: EntityId) {
+        self.inner.borrow_mut().dirty_views.insert(entity);
+    }
+
     pub fn take_views(&self) -> FxHashSet<EntityId> {
         mem::take(&mut self.inner.borrow_mut().dirty_views)
     }
@@ -3298,6 +3302,7 @@ impl Window {
         }
         self.invalidate_entities();
         cx.entities.clear_accessed();
+        cx.untracked_notifies_during_draw = Some(FxHashSet::default());
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
@@ -3440,6 +3445,15 @@ impl Window {
     fn record_entities_accessed(&mut self, cx: &mut App) {
         let mut entities_ref = cx.entities.accessed_entities.get_mut();
         let mut entities = mem::take(entities_ref.deref_mut());
+        let notified = cx
+            .untracked_notifies_during_draw
+            .take()
+            .expect("a draw records the entities notified during it");
+        // A notify that reached no window during this draw marks a view it
+        // rendered pending, as a notify during a later render of that view does.
+        for entity in notified.intersection(&entities) {
+            self.invalidator.mark_pending(*entity);
+        }
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,

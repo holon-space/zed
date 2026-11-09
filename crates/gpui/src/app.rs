@@ -820,6 +820,9 @@ pub struct App {
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
+    /// While a window draws: the entities notified that no window tracks yet,
+    /// such as a view during its first render.
+    pub(crate) untracked_notifies_during_draw: Option<FxHashSet<EntityId>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -911,6 +914,7 @@ impl App {
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
+                untracked_notifies_during_draw: None,
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
@@ -2819,6 +2823,9 @@ impl App {
             .collect();
 
         if live_invalidators.is_empty() {
+            if let Some(notified) = &mut self.untracked_notifies_during_draw {
+                notified.insert(entity_id);
+            }
             if self.pending_notifications.insert(entity_id) {
                 self.pending_effects
                     .push_back(Effect::Notify { emitter: entity_id });
